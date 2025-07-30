@@ -47,10 +47,8 @@ class MainActivityStandalone : AppCompatActivity() {
     
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
         cameraExecutor = Executors.newSingleThreadExecutor()
-        
-        // For standalone Android app, you would set up your UI here
-        // setContentView(R.layout.activity_main)
         
         Log.d(TAG, "Golf Tracker Camera standalone activity created")
         
