@@ -30,7 +30,7 @@ if (flutterRoot != null) {
 
 android {
     namespace 'com.example.golf_tracker'
-    compileSdk 34
+    compileSdk 33
     ndkVersion "25.1.8937393"
 
     compileOptions {
@@ -49,7 +49,7 @@ android {
     defaultConfig {
         applicationId "com.example.golf_tracker"
         minSdk 21
-        targetSdk 34
+        targetSdk 33
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
     }
