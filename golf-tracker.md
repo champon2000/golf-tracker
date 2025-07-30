@@ -257,107 +257,315 @@ class CameraStream: NSObject, FlutterStreamHandler, AVCaptureVideoDataOutputSamp
     }
 
     private func configure240Fps(for device: AVCaptureDevice) {
-        // 尋找支援 240 fps 的格式
         let desiredFps = 240.0
         var bestFormat: AVCaptureDevice.Format?
         var bestFrameRateRange: AVFrameRateRange?
+        var bestScore = 0.0
 
         for format in device.formats {
+            // 檢查像素格式是否為 YUV420
+            let pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+            guard pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                  pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
+                continue
+            }
+
             let ranges = format.videoSupportedFrameRateRanges
             for range in ranges {
-                if range.minFrameRate <= desiredFps && range.maxFrameRate >= desiredFps {
-                    // 檢查是否為高解析度格式，例如 1920x1080
+                if range.maxFrameRate >= desiredFps {
                     let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                    if dimensions.width >= 1280 && dimensions.height >= 720 { // 選擇一個合理的高解析度
-                        if bestFormat == nil || range.maxFrameRate > (bestFrameRateRange?.maxFrameRate ?? 0) {
-                            bestFormat = format
-                            bestFrameRateRange = range
-                        }
+                    
+                    // 計算格式分數：優先考慮240fps支援和合理解析度
+                    let fpsScore = min(range.maxFrameRate / desiredFps, 1.0)
+                    let resolutionScore = min(Double(dimensions.width * dimensions.height) / (1280.0 * 720.0), 2.0)
+                    let score = fpsScore * 2.0 + resolutionScore // 優先考慮幀率
+                    
+                    if score > bestScore && dimensions.width >= 720 && dimensions.height >= 480 {
+                        bestFormat = format
+                        bestFrameRateRange = range
+                        bestScore = score
                     }
                 }
             }
         }
 
         guard let format = bestFormat, let range = bestFrameRateRange else {
-            print("Warning: 240 fps format not found for device. Using default.")
+            print("Warning: 240 fps YUV420 format not found. Trying fallback...")
+            configureFallbackFormat(for: device)
             return
         }
 
         do {
             try device.lockForConfiguration()
             device.activeFormat = format
-            device.activeVideoMinFrameDuration = CMTimeMake(value: 1, timescale: Int32(desiredFps))
-            device.activeVideoMaxFrameDuration = CMTimeMake(value: 1, timescale: Int32(desiredFps))
+            
+            let frameDuration = CMTimeMake(value: 1, timescale: Int32(min(desiredFps, range.maxFrameRate)))
+            device.activeVideoMinFrameDuration = frameDuration
+            device.activeVideoMaxFrameDuration = frameDuration
+            
+            // 優化其他相機設定以提高效能
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            
             device.unlockForConfiguration()
-            print("Set camera to \(desiredFps) fps with format: \(format)")
+            let actualFps = min(desiredFps, range.maxFrameRate)
+            print("Set camera to \(actualFps) fps with format: \(format)")
         } catch {
             print("Could not lock device for configuration: \(error)")
         }
     }
+    
+    private func configureFallbackFormat(for device: AVCaptureDevice) {
+        // 尋找最高幀率的 YUV420 格式作為備選
+        var fallbackFormat: AVCaptureDevice.Format?
+        var maxFps = 0.0
+        
+        for format in device.formats {
+            let pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+            guard pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                  pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
+                continue
+            }
+            
+            for range in format.videoSupportedFrameRateRanges {
+                if range.maxFrameRate > maxFps {
+                    fallbackFormat = format
+                    maxFps = range.maxFrameRate
+                }
+            }
+        }
+        
+        if let format = fallbackFormat {
+            do {
+                try device.lockForConfiguration()
+                device.activeFormat = format
+                let frameDuration = CMTimeMake(value: 1, timescale: Int32(maxFps))
+                device.activeVideoMinFrameDuration = frameDuration
+                device.activeVideoMaxFrameDuration = frameDuration
+                device.unlockForConfiguration()
+                print("Using fallback format with \(maxFps) fps")
+            } catch {
+                print("Failed to configure fallback format: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Buffer Pool for Memory Management
+    private let bufferQueue = DispatchQueue(label: "buffer_queue", qos: .userInteractive)
+    private var bufferPool: [Data] = []
+    private let maxPoolSize = 5
+    private var frameCount = 0
+    private let frameSampleRate = 4 // 只處理每第4幀以降低CPU負載
 
     // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        frameCount += 1
+        
+        // 降採樣：只處理部分幀以維持效能
+        guard frameCount % frameSampleRate == 0 else { return }
+        
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        // 驗證像素格式
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+              pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else {
+            print("Unsupported pixel format: \(pixelFormat)")
+            return
+        }
 
+        bufferQueue.async { [weak self] in
+            self?.processPixelBuffer(pixelBuffer)
+        }
+    }
+    
+    private func processPixelBuffer(_ pixelBuffer: CVPixelBuffer) {
         // 鎖定像素緩衝區
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        let lockFlags = CVPixelBufferLockFlags.readOnly
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, lockFlags) == kCVReturnSuccess else {
+            return
+        }
+        
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, lockFlags)
+        }
 
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        
         // 獲取 Y 平面數據
-        let yPlaneBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+        guard let yPlaneBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return }
         let yPlaneBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
         let yPlaneHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
 
         // 獲取 UV 平面數據 (對於 NV12 格式)
-        let uvPlaneBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
+        guard let uvPlaneBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else { return }
         let uvPlaneBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
         let uvPlaneHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
 
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
+        // 計算實際需要的數據大小（考慮 stride）
+        let yDataSize = width * height
+        let uvDataSize = width * height / 2 // UV平面大小為Y平面的一半
+        let totalSize = yDataSize + uvDataSize
 
-        // 計算總大小
-        let ySize = yPlaneBytesPerRow * yPlaneHeight
-        let uvSize = uvPlaneBytesPerRow * uvPlaneHeight
-        let totalSize = ySize + uvSize
-
-        // 創建一個單一的 Data 物件包含 Y 和 UV 平面
-        var data = Data(capacity: totalSize)
-        data.append(Data(bytes: yPlaneBaseAddress!, count: ySize))
-        data.append(Data(bytes: uvPlaneBaseAddress!, count: uvSize))
-
-        // 解鎖像素緩衝區
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        // 從緩衝池獲取或創建新的 Data 物件
+        var data = getBufferFromPool(size: totalSize)
+        
+        // 優化的數據複製：考慮 stride
+        data.withUnsafeMutableBytes { bytes in
+            let dataPtr = bytes.bindMemory(to: UInt8.self).baseAddress!
+            
+            // 複製 Y 平面數據，處理 stride
+            if yPlaneBytesPerRow == width {
+                // 沒有 padding，直接複製
+                memcpy(dataPtr, yPlaneBaseAddress, yDataSize)
+            } else {
+                // 有 padding，逐行複製
+                for row in 0..<height {
+                    let srcOffset = row * yPlaneBytesPerRow
+                    let dstOffset = row * width
+                    memcpy(dataPtr + dstOffset, yPlaneBaseAddress + srcOffset, width)
+                }
+            }
+            
+            // 複製 UV 平面數據
+            let uvDestPtr = dataPtr + yDataSize
+            if uvPlaneBytesPerRow == width {
+                memcpy(uvDestPtr, uvPlaneBaseAddress, uvDataSize)
+            } else {
+                for row in 0..<(height / 2) {
+                    let srcOffset = row * uvPlaneBytesPerRow
+                    let dstOffset = row * width
+                    memcpy(uvDestPtr + dstOffset, uvPlaneBaseAddress + srcOffset, width)
+                }
+            }
+        }
 
         // 將數據和元數據發送到 Flutter
         let frameData: [String: Any] = [
             "width": width,
             "height": height,
-            "bytesPerRow": yPlaneBytesPerRow, // Y 平面的 bytesPerRow
-            "uvBytesPerRow": uvPlaneBytesPerRow, // UV 平面的 bytesPerRow
+            "bytesPerRow": width, // 標準化後的 bytesPerRow
+            "uvBytesPerRow": width, // UV 平面的 bytesPerRow
             "buffer": FlutterStandardTypedData(bytes: data)
         ]
 
+        // 使用背景執行緒發送以避免阻塞主執行緒
         DispatchQueue.main.async { [weak self] in
             self?.eventSink?(frameData)
         }
+        
+        // 將緩衝區歸還到池中
+        returnBufferToPool(data)
+    }
+    
+    private func getBufferFromPool(size: Int) -> Data {
+        if let buffer = bufferPool.popLast(), buffer.count == size {
+            return buffer
+        }
+        return Data(count: size)
+    }
+    
+    private func returnBufferToPool(_ buffer: Data) {
+        guard bufferPool.count < maxPoolSize else { return }
+        bufferPool.append(buffer)
     }
 }
 
 // 註冊 CameraStream 類別到 Flutter
 public class SwiftGolfTrackerPlugin: NSObject, FlutterPlugin {
-  public static func register(with registrar: FlutterPluginRegistrar) {
-    let instance = CameraStream()
-    let channel = FlutterEventChannel(name: "com.example.golf_tracker/camera_stream", binaryMessenger: registrar.messenger())
-    channel.setStreamHandler(instance)
-
-    // 如果有其他 MethodChannel，可以在這裡註冊
-    let methodChannel = FlutterMethodChannel(name: "com.example.golf_tracker/camera_control", binaryMessenger: registrar.messenger())
-    methodChannel.setMethodCallHandler { (call: FlutterMethodCall, result: @escaping FlutterResult) in
-      // TODO: 處理其他方法呼叫，例如啟動/停止相機等
-      result(FlutterMethodNotImplemented)
+    private static var cameraStream: CameraStream?
+    
+    public static func register(with registrar: FlutterPluginRegistrar) {
+        // 初始化 CameraStream 實例
+        let instance = SwiftGolfTrackerPlugin()
+        registrar.addMethodCallDelegate(instance, channel: FlutterMethodChannel(name: "com.example.golf_tracker/camera_control", binaryMessenger: registrar.messenger()))
+        
+        // 註冊 EventChannel
+        cameraStream = CameraStream()
+        let eventChannel = FlutterEventChannel(name: "com.example.golf_tracker/camera_stream", binaryMessenger: registrar.messenger())
+        eventChannel.setStreamHandler(cameraStream)
+        
+        // 監聽應用生命週期以管理相機資源
+        registrar.addApplicationDelegate(instance)
     }
-  }
+    
+    public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        switch call.method {
+        case "startCamera":
+            checkCameraPermissionAndStart(result: result)
+        case "stopCamera":
+            stopCameraStream(result: result)
+        case "checkCameraPermission":
+            result(checkCameraPermission())
+        default:
+            result(FlutterMethodNotImplemented)
+        }
+    }
+    
+    private func checkCameraPermissionAndStart(result: @escaping FlutterResult) {
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        
+        switch status {
+        case .authorized:
+            result("Camera permission granted")
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        result("Camera permission granted")
+                    } else {
+                        result(FlutterError(code: "PERMISSION_DENIED", 
+                                          message: "Camera permission denied", 
+                                          details: nil))
+                    }
+                }
+            }
+        case .denied, .restricted:
+            result(FlutterError(code: "PERMISSION_DENIED", 
+                              message: "Camera permission denied or restricted", 
+                              details: nil))
+        @unknown default:
+            result(FlutterError(code: "PERMISSION_UNKNOWN", 
+                              message: "Unknown camera permission status", 
+                              details: nil))
+        }
+    }
+    
+    private func stopCameraStream(result: @escaping FlutterResult) {
+        SwiftGolfTrackerPlugin.cameraStream?.stopCamera()
+        result("Camera stopped")
+    }
+    
+    private func checkCameraPermission() -> Bool {
+        return AVCaptureDevice.authorizationStatus(for: .video) == .authorized
+    }
+}
+
+// MARK: - Application Lifecycle Delegate
+extension SwiftGolfTrackerPlugin: FlutterApplicationLifeCycleDelegate {
+    public func applicationDidEnterBackground(_ application: UIApplication) {
+        // 應用進入背景時暫停相機以節省資源
+        SwiftGolfTrackerPlugin.cameraStream?.stopCamera()
+    }
+    
+    public func applicationWillEnterForeground(_ application: UIApplication) {
+        // 應用即將進入前景時恢復相機（如果有權限）
+        if checkCameraPermission() {
+            // 相機會在用戶開始監聽流時自動重啟
+        }
+    }
+    
+    public func applicationWillTerminate(_ application: UIApplication) {
+        // 應用終止時清理資源
+        SwiftGolfTrackerPlugin.cameraStream?.stopCamera()
+        SwiftGolfTrackerPlugin.cameraStream = nil
+    }
 }
 
 android/src/main/kotlin/com/example/golf_tracker/CameraStream.kt
@@ -403,6 +611,12 @@ class CameraStream(private val context: Context, private val lifecycleOwner: Lif
         eventSink = null
     }
 
+    // Buffer pool for memory management
+    private val bufferPool = mutableListOf<ByteArray>()
+    private val maxPoolSize = 5
+    private var frameCount = 0
+    private val frameSampleRate = 4 // 只處理每第4幀以降低CPU負載
+
     @SuppressLint("UnsafeOptInUsageError")
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -410,89 +624,48 @@ class CameraStream(private val context: Context, private val lifecycleOwner: Lif
             cameraProvider = cameraProviderFuture.get()
             val preview = Preview.Builder().build()
 
-            // 設置 ImageAnalysis
+            // 設置 ImageAnalysis，優化為240fps
             imageAnalysis = ImageAnalysis.Builder()
-                .setTargetResolution(Size(1280, 720)) // 選擇一個高解析度
+                .setTargetResolution(Size(1280, 720)) // 高解析度
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setImageQueueDepth(1) // 確保只處理最新幀
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
 
-            // 嘗試設定 240 fps
+            // 配置240fps（如果支援）
             val camera2Config = Camera2Interop.Extender(imageAnalysis!!)
-            camera2Config.setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                android.util.Range(TARGET_FPS, TARGET_FPS)
+            
+            // 設定多個FPS範圍選項，以便找到最佳匹配
+            val fpsRanges = arrayOf(
+                android.util.Range(TARGET_FPS, TARGET_FPS),      // 240fps
+                android.util.Range(120, 240),                   // 120-240fps
+                android.util.Range(60, 120),                    // 60-120fps
+                android.util.Range(30, 60)                      // 30-60fps fallback
             )
+            
+            for (range in fpsRanges) {
+                try {
+                    camera2Config.setCaptureRequestOption(
+                        android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                        range
+                    )
+                    Log.d(TAG, "Set FPS range: $range")
+                    break
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to set FPS range $range: ${e.message}")
+                }
+            }
 
             imageAnalysis?.setAnalyzer(cameraExecutor) { imageProxy ->
-                // 確保是 YUV_420_888 格式
-                if (imageProxy.format == ImageFormat.YUV_420_888) {
-                    val planes = imageProxy.planes
-                    val yBuffer = planes[0].buffer
-                    val uBuffer = planes[1].buffer
-                    val vBuffer = planes[2].buffer
-
-                    val ySize = yBuffer.remaining()
-                    val uSize = uBuffer.remaining()
-                    val vSize = vBuffer.remaining()
-
-                    val nv12Bytes = ByteArray(ySize + uSize + vSize) // 暫時使用，實際應轉換為單一 ByteBuffer
-                    yBuffer.get(nv12Bytes, 0, ySize)
-                    vBuffer.get(nv12Bytes, ySize, vSize) // 注意：對於 NV12，U 和 V 是交錯的
-                    uBuffer.get(nv12Bytes, ySize + vSize, uSize)
-
-                    // TODO: 將 YUV_420_888 轉換為 NV112 (Y + UV 交錯)
-                    // 目前簡單地將所有平面數據合併，這不是標準的 NV12 格式，
-                    // 需要更精確的轉換邏輯來確保 UV 平面的正確交錯。
-                    // 這裡僅為骨架，實際應用中需要實現正確的 YUV420_888 到 NV12 轉換。
-                    val y = planes[0]
-                    val u = planes[1]
-                    val v = planes[2]
-
-                    val yBytes = ByteArray(y.buffer.remaining())
-                    y.buffer.get(yBytes)
-
-                    val uBytes = ByteArray(u.buffer.remaining())
-                    u.buffer.get(uBytes)
-
-                    val vBytes = ByteArray(v.buffer.remaining())
-                    v.buffer.get(vBytes)
-
-                    // 這裡需要將 YUV_420_888 的三個平面數據組合成一個 NV12 格式的 Uint8List
-                    // NV12 格式是 YYYY...UVUVUV...
-                    // 由於 CameraX 直接提供了 YUV_420_888，我們需要手動將其轉換為 NV12
-                    val yPlane = y.buffer
-                    val uPlane = u.buffer
-                    val vPlane = v.buffer
-
-                    val ySizeCorrected = yPlane.limit() - yPlane.position()
-                    val uvSizeCorrected = uPlane.limit() - uPlane.position() + vPlane.limit() - vPlane.position()
-
-                    val totalBufferSize = ySizeCorrected + uvSizeCorrected
-                    val combinedBuffer = ByteBuffer.allocateDirect(totalBufferSize)
-
-                    combinedBuffer.put(yPlane)
-                    // 將 U 和 V 交錯放入，這是 NV12 的要求
-                    // 這裡的轉換是簡化版，實際應考慮 stride 和 pixel_stride
-                    // TODO: 實現正確的 YUV_420_888 到 NV12 轉換
-                    val uvPlaneCombined = ByteBuffer.allocateDirect(uPlane.remaining() + vPlane.remaining())
-                    while (uPlane.hasRemaining() || vPlane.hasRemaining()) {
-                        if (uPlane.hasRemaining()) uvPlaneCombined.put(uPlane.get())
-                        if (vPlane.hasRemaining()) uvPlaneCombined.put(vPlane.get())
-                    }
-                    uvPlaneCombined.flip()
-                    combinedBuffer.put(uvPlaneCombined)
-
-                    val frameData = mapOf(
-                        "width" to imageProxy.width,
-                        "height" to imageProxy.height,
-                        "bytesPerRow" to planes[0].rowStride, // Y 平面的 rowStride
-                        "uvBytesPerRow" to planes[1].rowStride, // UV 平面的 rowStride
-                        "buffer" to combinedBuffer.array() // 將 ByteBuffer 轉換為 ByteArray
-                    )
-                    eventSink?.success(frameData)
+                frameCount++
+                
+                // 降採樣：只處理部分幀以維持效能
+                if (frameCount % frameSampleRate != 0) {
+                    imageProxy.close()
+                    return@setAnalyzer
                 }
-                imageProxy.close()
+
+                processImageProxy(imageProxy)
             }
 
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
@@ -514,6 +687,106 @@ class CameraStream(private val context: Context, private val lifecycleOwner: Lif
         }, ContextCompat.getMainExecutor(context))
     }
 
+    private fun processImageProxy(imageProxy: ImageProxy) {
+        if (imageProxy.format != ImageFormat.YUV_420_888) {
+            Log.w(TAG, "Unsupported image format: ${imageProxy.format}")
+            imageProxy.close()
+            return
+        }
+
+        try {
+            val nv12Data = convertYuv420ToNv12(imageProxy)
+            
+            val frameData = mapOf(
+                "width" to imageProxy.width,
+                "height" to imageProxy.height,
+                "bytesPerRow" to imageProxy.width, // 標準化後的 bytesPerRow
+                "uvBytesPerRow" to imageProxy.width, // UV 平面的 bytesPerRow
+                "buffer" to nv12Data
+            )
+            
+            eventSink?.success(frameData)
+            returnBufferToPool(nv12Data)
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to process image: ${e.message}")
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun convertYuv420ToNv12(imageProxy: ImageProxy): ByteArray {
+        val planes = imageProxy.planes
+        val yPlane = planes[0]
+        val uPlane = planes[1]
+        val vPlane = planes[2]
+        
+        val width = imageProxy.width
+        val height = imageProxy.height
+        
+        // 計算所需的緩衝區大小
+        val ySize = width * height
+        val uvSize = width * height / 2
+        val totalSize = ySize + uvSize
+        
+        // 從緩衝池獲取或創建新的緩衝區
+        val nv12Data = getBufferFromPool(totalSize)
+        
+        // 複製 Y 平面數據
+        val yBuffer = yPlane.buffer
+        val yRowStride = yPlane.rowStride
+        val yPixelStride = yPlane.pixelStride
+        
+        var yIndex = 0
+        for (row in 0 until height) {
+            for (col in 0 until width) {
+                nv12Data[yIndex++] = yBuffer[row * yRowStride + col * yPixelStride]
+            }
+        }
+        
+        // 轉換和交錯 UV 平面數據
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+        val uRowStride = uPlane.rowStride
+        val vRowStride = vPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vPixelStride = vPlane.pixelStride
+        
+        var uvIndex = ySize
+        val uvHeight = height / 2
+        val uvWidth = width / 2
+        
+        for (row in 0 until uvHeight) {
+            for (col in 0 until uvWidth) {
+                val uValue = uBuffer[row * uRowStride + col * uPixelStride]
+                val vValue = vBuffer[row * vRowStride + col * vPixelStride]
+                
+                // NV12 格式：UV 交錯 (UVUVUV...)
+                nv12Data[uvIndex++] = uValue
+                nv12Data[uvIndex++] = vValue
+            }
+        }
+        
+        return nv12Data
+    }
+    
+    @Synchronized
+    private fun getBufferFromPool(size: Int): ByteArray {
+        val buffer = bufferPool.find { it.size == size }
+        if (buffer != null) {
+            bufferPool.remove(buffer)
+            return buffer
+        }
+        return ByteArray(size)
+    }
+    
+    @Synchronized
+    private fun returnBufferToPool(buffer: ByteArray) {
+        if (bufferPool.size < maxPoolSize) {
+            bufferPool.add(buffer)
+        }
+    }
+
     private fun stopCamera() {
         cameraProvider?.unbindAll()
         cameraExecutor.shutdown()
@@ -522,27 +795,76 @@ class CameraStream(private val context: Context, private val lifecycleOwner: Lif
 }
 
 // FlutterPlugin 實現
-class GolfTrackerPlugin : FlutterPlugin, LifecycleOwner {
+class GolfTrackerPlugin : FlutterPlugin, LifecycleOwner, FlutterPlugin.FlutterPluginBinding.ActivityPluginBinding {
     private lateinit var applicationContext: Context
-    private var lifecycle: CameraLifecycle = CameraLifecycle()
+    private var cameraStream: CameraStream? = null
+    private val lifecycle = CameraLifecycle()
+    private var eventChannel: EventChannel? = null
+    private var methodChannel: MethodChannel? = null
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         applicationContext = flutterPluginBinding.applicationContext
 
         // 註冊 EventChannel
-        val eventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "com.example.golf_tracker/camera_stream")
-        eventChannel.setStreamHandler(CameraStream(applicationContext, this))
+        eventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "com.example.golf_tracker/camera_stream")
+        cameraStream = CameraStream(applicationContext, this)
+        eventChannel?.setStreamHandler(cameraStream)
 
-        // 註冊 MethodChannel (如果需要控制相機)
-        val methodChannel = MethodChannel(flutterPluginBinding.binaryMessenger, "com.example.golf_tracker/camera_control")
-        methodChannel.setMethodCallHandler { call, result ->
-            // TODO: 處理其他方法呼叫，例如啟動/停止相機等
-            result.notImplemented()
+        // 註冊 MethodChannel
+        methodChannel = MethodChannel(flutterPluginBinding.binaryMessenger, "com.example.golf_tracker/camera_control")
+        methodChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startCamera" -> {
+                    try {
+                        lifecycle.onStart()
+                        lifecycle.onResume()
+                        result.success("Camera started")
+                    } catch (e: Exception) {
+                        result.error("CAMERA_ERROR", "Failed to start camera: ${e.message}", null)
+                    }
+                }
+                "stopCamera" -> {
+                    try {
+                        lifecycle.onPause()
+                        lifecycle.onStop()
+                        result.success("Camera stopped")
+                    } catch (e: Exception) {
+                        result.error("CAMERA_ERROR", "Failed to stop camera: ${e.message}", null)
+                    }
+                }
+                "checkCameraPermission" -> {
+                    val hasPermission = checkCameraPermission()
+                    result.success(hasPermission)
+                }
+                else -> {
+                    result.notImplemented()
+                }
+            }
         }
+        
+        // 監聽 Flutter 引擎生命週期
+        lifecycle.onCreate()
+        lifecycle.onStart()
+        lifecycle.onResume()
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        // 清理資源
+        lifecycle.onPause()
+        lifecycle.onStop()
+        lifecycle.onDestroy()
+        
+        cameraStream = null
+        eventChannel?.setStreamHandler(null)
+        eventChannel = null
+        methodChannel?.setMethodCallHandler(null)
+        methodChannel = null
+    }
+
+    private fun checkCameraPermission(): Boolean {
+        return androidx.core.content.ContextCompat.checkSelfPermission(
+            applicationContext,
+            android.Manifest.permission.CAMERA
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
     }
 
     // LifecycleOwner 實現，用於 CameraX
@@ -550,18 +872,72 @@ class GolfTrackerPlugin : FlutterPlugin, LifecycleOwner {
         get() = this.lifecycle
 
     class CameraLifecycle : androidx.lifecycle.Lifecycle() {
-        init {
-            currentState = State.RESUMED // 假設應用啟動時相機是活躍的
+        private val observers = mutableSetOf<LifecycleObserver>()
+        private var _currentState = State.INITIALIZED
+
+        override fun getCurrentState(): State = _currentState
+
+        override fun addObserver(observer: LifecycleObserver) {
+            observers.add(observer)
         }
 
-        // TODO: 根據 Flutter 應用生命週期更新此狀態
-        // 這需要在 FlutterPlugin 中監聽 Flutter 的生命週期事件並更新此處
-        fun onCreate() { currentState = State.CREATED }
-        fun onStart() { currentState = State.STARTED }
-        fun onResume() { currentState = State.RESUMED }
-        fun onPause() { currentState = State.STARTED } // 暫停時仍保持 STARTED
-        fun onStop() { currentState = State.CREATED }
-        fun onDestroy() { currentState = State.DESTROYED }
+        override fun removeObserver(observer: LifecycleObserver) {
+            observers.remove(observer)
+        }
+
+        fun onCreate() {
+            _currentState = State.CREATED
+            notifyObservers(Event.ON_CREATE)
+            Log.d("CameraLifecycle", "onCreate: $currentState")
+        }
+
+        fun onStart() {
+            _currentState = State.STARTED
+            notifyObservers(Event.ON_START)
+            Log.d("CameraLifecycle", "onStart: $currentState")
+        }
+
+        fun onResume() {
+            _currentState = State.RESUMED
+            notifyObservers(Event.ON_RESUME)
+            Log.d("CameraLifecycle", "onResume: $currentState")
+        }
+
+        fun onPause() {
+            _currentState = State.STARTED
+            notifyObservers(Event.ON_PAUSE)
+            Log.d("CameraLifecycle", "onPause: $currentState")
+        }
+
+        fun onStop() {
+            _currentState = State.CREATED
+            notifyObservers(Event.ON_STOP)
+            Log.d("CameraLifecycle", "onStop: $currentState")
+        }
+
+        fun onDestroy() {
+            _currentState = State.DESTROYED
+            notifyObservers(Event.ON_DESTROY)
+            Log.d("CameraLifecycle", "onDestroy: $currentState")
+        }
+
+        private fun notifyObservers(event: Event) {
+            observers.forEach { observer ->
+                try {
+                    when (event) {
+                        Event.ON_CREATE -> (observer as? DefaultLifecycleObserver)?.onCreate(this@CameraLifecycle)
+                        Event.ON_START -> (observer as? DefaultLifecycleObserver)?.onStart(this@CameraLifecycle)
+                        Event.ON_RESUME -> (observer as? DefaultLifecycleObserver)?.onResume(this@CameraLifecycle)
+                        Event.ON_PAUSE -> (observer as? DefaultLifecycleObserver)?.onPause(this@CameraLifecycle)
+                        Event.ON_STOP -> (observer as? DefaultLifecycleObserver)?.onStop(this@CameraLifecycle)
+                        Event.ON_DESTROY -> (observer as? DefaultLifecycleObserver)?.onDestroy(this@CameraLifecycle)
+                        else -> {}
+                    }
+                } catch (e: Exception) {
+                    Log.e("CameraLifecycle", "Error notifying observer: ${e.message}")
+                }
+            }
+        }
     }
 }
 

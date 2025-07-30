@@ -1,0 +1,75 @@
+name: golf_tracker
+description: A high-performance golf ball tracking application with real-time camera analysis.
+
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # Camera and image processing
+  camera: ^0.10.5+5
+  
+  # Isolate support
+  flutter_isolate: ^2.0.4
+  
+  # TensorFlow Lite
+  tflite_flutter: ^0.10.4
+  tflite_flutter_helper: ^0.3.1
+  
+  # Database
+  sqflite: ^2.3.0
+  path: ^1.8.3
+  
+  # Permissions
+  permission_handler: ^11.0.1
+  
+  # State management and utilities
+  provider: ^6.0.5
+  shared_preferences: ^2.2.2
+  
+  # Math and vector operations
+  vector_math: ^2.1.4
+  
+  # Platform channels
+  flutter/services:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  
+  # Testing dependencies
+  mockito: ^5.4.4
+  build_runner: ^2.4.7
+  test: ^1.25.2
+  integration_test:
+    sdk: flutter
+  
+  # Performance testing
+  benchmark_harness: ^2.2.2
+  
+  # Test data generation
+  faker: ^2.1.0
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/models/
+    - assets/images/
+
+  # Platform-specific configurations
+  plugin:
+    platforms:
+      android:
+        package: com.example.golf_tracker
+        pluginClass: GolfTrackerPlugin
+      ios:
+        pluginClass: GolfTrackerPlugin
