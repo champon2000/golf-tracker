@@ -85,9 +85,16 @@ android {
 }
 
 // Flutter configuration will be applied if SDK is available
+if (flutterRoot != null) {
+    flutter {
+        source '../..'
+    }
+}
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    
+    // Camera dependencies
     implementation 'androidx.camera:camera-core:1.3.0'
     implementation 'androidx.camera:camera-camera2:1.3.0'
     implementation 'androidx.camera:camera-lifecycle:1.3.0'
@@ -95,4 +102,12 @@ dependencies {
     implementation 'androidx.camera:camera-view:1.3.0'
     implementation 'androidx.camera:camera-extensions:1.3.0'
     implementation 'androidx.concurrent:concurrent-futures:1.1.0'
+    
+    // Flutter dependencies - provide stubs if Flutter SDK not available
+    if (flutterRoot != null) {
+        // Will be added by Flutter gradle plugin
+    } else {
+        // Stub Flutter dependencies for compilation
+        compileOnly 'org.jetbrains:annotations:23.0.0'
+    }
 }
