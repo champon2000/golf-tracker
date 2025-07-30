@@ -84,12 +84,8 @@ android {
     }
 }
 
-// Flutter configuration will be applied if SDK is available
-if (flutterRoot != null) {
-    flutter {
-        source '../..'
-    }
-}
+// Flutter configuration would be applied here if SDK is properly configured
+// For now, building as standalone Android app
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
@@ -103,11 +99,10 @@ dependencies {
     implementation 'androidx.camera:camera-extensions:1.3.0'
     implementation 'androidx.concurrent:concurrent-futures:1.1.0'
     
-    // Flutter dependencies - provide stubs if Flutter SDK not available
-    if (flutterRoot != null) {
-        // Will be added by Flutter gradle plugin
-    } else {
-        // Stub Flutter dependencies for compilation
-        compileOnly 'org.jetbrains:annotations:23.0.0'
-    }
+    // Basic Flutter engine dependencies for compilation
+    // Note: These are minimal stubs - full Flutter functionality requires proper SDK setup
+    implementation 'androidx.fragment:fragment:1.6.1'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.lifecycle:lifecycle-common:2.6.2'
+    compileOnly 'org.jetbrains:annotations:23.0.0'
 }
